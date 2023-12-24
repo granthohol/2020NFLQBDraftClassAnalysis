@@ -1,0 +1,160 @@
+---
+title: "QB Aggressiveness"
+author: "Grant Hohol"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## QB Agressiveness and Relative Success
+Quantifying the aggresiveness of each Quarterback and their success in terms 
+of accuracy and completions relative to that aggresiveness. 
+
+Loading necessary packages
+```{r}
+library(magrittr)
+library(tidyverse)
+library(nflfastR)
+library(ranger) # modeling package
+library(ggthemes)
+library(ggimage)
+library(gt)
+library(vip)
+```
+
+## Completion Percentage Over Expectation Model Creation
+Loadig play by play data and create a clean data frame of pass plays with the 
+variables we care about relative to completion percentage. 
+```{r}
+pbp <- load_pbp(2020:2023)
+
+# create new dataset of pass plays with no na values in the variables we care about
+pass_plays <- pbp %>%
+  filter(pass == 1) %>%
+  filter(!is.na(air_yards), !is.na(down), !is.na(score_differential),
+         !is.na(ydstogo), !is.na(half_seconds_remaining)) %>%
+  # make the down variable a "factor" variable so that it is not just numeric
+  mutate(down = as.factor(down))
+
+# select the variables we want to weight against comeplete_pass
+cpoe_model_data <- pass_plays %>%
+  select(complete_pass, down, score_differential, ydstogo, 
+         half_seconds_remaining, yardline_100, air_yards, qb_hit, goal_to_go)
+```
+
+Applying a linear regression model for the dependent variable of a completed pass
+```{r}
+# apply a linear regression model
+cpoe_lm <- lm(complete_pass ~ down + score_differential + ydstogo +
+              half_seconds_remaining + yardline_100 + air_yards + qb_hit +
+               goal_to_go, data = cpoe_model_data)
+
+```
+
+What variables matter the most? 
+```{r}
+summary(cpoe_lm)
+
+vip(cpoe_lm)
+```
+
+Unsurprisingly, air yards, how far the ball travels in the air, matters by far 
+the most in terms of completion percentage. 
+
+Creating a data frame of expected completion percentages on each pass play
+```{r}
+# data frame of expected completion percentages for every play based on our
+# previously made linear regression model
+cp_preds <- data.frame(predict.lm(cpoe_lm, newdata=pass_plays)) %>%
+  rename(exp_cp =   predict.lm.cpoe_lm..newdata...pass_plays.)
+```
+
+Creating an Air Yards Over Expected Regression Model 
+```{r}
+pass_plays_ayoe_model_data <- pass_plays %>%
+  select(air_yards, down, score_differential, ydstogo, half_seconds_remaining, 
+         qb_hit, yardline_100) 
+
+air_yards_lm <- lm(air_yards ~ down + score_differential + ydstogo + 
+                     half_seconds_remaining + qb_hit + yardline_100,
+                   data = pass_plays_ayoe_model_data)
+
+summary(air_yards_lm)
+
+# shows the importance of each variable
+vip(air_yards_lm, num_features = 7)
+```
+
+Here, we see that whether the QB was hit matters again, but where the offense 
+is on the field is the most important factor. This makes sense because the possible 
+air yards gets smaller as an offense approaches the endzone. 
+
+Creating a new data frame with Completion % Over Expected and Air Yards Over 
+Expected added 
+```{r}
+# takes in fitted linear regression model as main argument
+# makes predictions based off of passed data
+# gives us a vector so wrap it in a data frame
+air_yard_preds <- data.frame(predict.lm(air_yards_lm, newdata = pass_plays)) %>%
+  # change name of column in data frame
+  rename(exp_air_yards = predict.lm.air_yards_lm..newdata...pass_plays.)
+
+new_pass_plays <- cbind(pass_plays, cp_preds, air_yard_preds)
+
+# create cpoe column
+new_pass_plays <- new_pass_plays %>%
+  mutate(new_cpoe = complete_pass - exp_cp) %>%
+  mutate(ayoe = air_yards - exp_air_yards) %>%
+  left_join(teams_colors_logos, by = c("posteam" = "team_abbr"))
+```
+
+Creating another new data frame with just the QB name, their CPOE and AYOE
+```{r}
+# data frame of just QBs CPOE and AYOE
+oe_by_passer <- new_pass_plays %>%
+  group_by(passer) %>%
+  summarize(passes = n(), avg_cpoe = mean(new_cpoe), avg_ayoe = mean(ayoe),
+            team_logo = last(team_logo_espn)) %>%
+    filter(passes >= 750) %>%
+  filter(!(passer %in% c("Z.Wilson", "S.Darnold", "C.Wentz", "B.Mayfield", "J.Fields"))) %>%
+  mutate(condition = ifelse(passer %in% c("T.Tagovailoa", "J.Herbert", "J.Burrow"), 1, 0.25)) %>%
+  arrange(-avg_cpoe)
+```
+
+Make the graph
+```{r}
+passers_combined <- oe_by_passer %>%
+  filter(passer %in% c("T.Tagovailoa", "J.Herbert", "J.Burrow"))
+
+oe_by_passer %>%
+  ggplot(aes(x = avg_ayoe, y = avg_cpoe)) + 
+  geom_hline(yintercept = mean(oe_by_passer$avg_cpoe), linetype = "dashed") + 
+  geom_vline(xintercept = mean(oe_by_passer$avg_ayoe), linetype = "dashed") + 
+  geom_image(data = passers_combined, aes(image = team_logo), size = 0.05, asp = 16/9) + # set image, size of the images, and aspect ratio of images SCATTERPLOT
+  geom_point(shape = 21) +
+  ggrepel::geom_text_repel(aes(label = passer), size = 4, alpha=oe_by_passer$condition) +
+  labs(x = "Average Air Yards Over Expected",
+       y = "Average Completion % Over Expected",
+       title = "AYOE vs CPOE for NFL QBS",
+       subtitle = "2020-2023") + 
+  theme_fivethirtyeight() + 
+  theme(axis.title = element_text(size = 14))
+```
+
+From this graph we can see that Tua Tagovailoa has around the same completion 
+percentage over expected as Herbert, but he's doing it on throws further down 
+the field, which is more impressive. Burrow has a higher CPOE than Tua, but on 
+throws less far down the field. The main loser of this insight is Justin Herbert. 
+He has the lowest CPOE while also having the lowest AYOE. 
+
+
+
+
+
+
+
+
+
+
